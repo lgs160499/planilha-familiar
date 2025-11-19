@@ -12,6 +12,12 @@ export enum PaymentMethod {
   TRANSFER = 'Transferência'
 }
 
+export enum Responsible {
+  LUCAS = 'Lucas',
+  NATIELY = 'Natiely',
+  BOTH = 'Ambos'
+}
+
 export interface IncomeDetails {
   salaryFixedNatiely: number;
   salaryVarNatiely: number;
@@ -36,6 +42,7 @@ export interface Expense {
   isRecurring?: boolean;
   paymentMethod: PaymentMethod;
   installments?: string; // ex: "1/12"
+  responsible: Responsible;
 }
 
 export interface MonthData {

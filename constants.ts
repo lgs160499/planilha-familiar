@@ -1,11 +1,11 @@
-import { MonthData, ExpenseCategory, PaymentMethod } from './types';
+import { MonthData, ExpenseCategory, IncomeDetails, Budget } from './types';
 
 export const MONTH_NAMES = [
   "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
   "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
 ];
 
-const DEFAULT_INCOME = {
+const DEFAULT_INCOME: IncomeDetails = {
   salaryFixedNatiely: 3500,
   salaryVarNatiely: 0,
   salaryFixedLucasWS: 4000,
@@ -14,10 +14,14 @@ const DEFAULT_INCOME = {
   others: 0
 };
 
-const DEFAULT_BUDGET = {
-  [ExpenseCategory.ESSENTIAL]: 4000,
-  [ExpenseCategory.DESIRE]: 1000,
-  [ExpenseCategory.INVESTMENT]: 2000
+// Função para calcular orçamento sugerido baseado na renda (50/30/20)
+const calculateDefaultBudget = (income: IncomeDetails): Budget => {
+  const totalIncome = Object.values(income).reduce((a, b) => a + b, 0);
+  return {
+    [ExpenseCategory.ESSENTIAL]: totalIncome * 0.50,  // 50%
+    [ExpenseCategory.DESIRE]: totalIncome * 0.30,     // 30%
+    [ExpenseCategory.INVESTMENT]: totalIncome * 0.20  // 20%
+  };
 };
 
 // Dados antigos removidos conforme solicitado. A lista inicia vazia.
@@ -43,6 +47,8 @@ const generateFuturePeriod = (): MonthData[] => {
     { index: 9, year: 2026 },  // Outubro 2026
   ];
 
+  const defaultBudget = calculateDefaultBudget(DEFAULT_INCOME);
+
   periods.forEach(({ index, year }) => {
     const monthName = MONTH_NAMES[index];
     // Cria ID único ex: nov-2025
@@ -54,7 +60,7 @@ const generateFuturePeriod = (): MonthData[] => {
       year,
       monthIndex: index,
       income: { ...DEFAULT_INCOME },
-      budget: { ...DEFAULT_BUDGET },
+      budget: { ...defaultBudget },
       expenses: []
     });
   });

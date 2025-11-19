@@ -1,187 +1,300 @@
-import React, { useState, useCallback } from 'react';
-import { INITIAL_DATA } from './constants';
+import React, { useState, useCallback, useEffect } from 'react';
 import { MonthData, Expense, IncomeDetails, ExpenseCategory } from './types';
 import { Dashboard } from './components/Dashboard';
 import { IncomeForm } from './components/IncomeForm';
 import { ExpenseTable } from './components/ExpenseTable';
 import { BudgetForm } from './components/BudgetForm';
+import { Login } from './components/Login';
 import { analyzeFinances } from './services/geminiService';
+import { auth, logoutUser, subscribeToFinanceData, saveFinanceData } from './services/firebase';
+import { onAuthStateChanged, User } from 'firebase/auth';
 
 const App: React.FC = () => {
-  // In a real app, this would come from a database/localstorage
-  const [data, setData] = useState<MonthData[]>(INITIAL_DATA);
-  const [selectedMonthId, setSelectedMonthId] = useState<string>(INITIAL_DATA[0].id);
+  const [user, setUser] = useState<User | null>(null);
+  const [loadingAuth, setLoadingAuth] = useState(true);
+  
+  // Data começa vazia e é preenchida pelo Firestore
+  const [data, setData] = useState<MonthData[]>([]);
+  const [selectedMonthId, setSelectedMonthId] = useState<string>(""); // Set after load
   
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+
+  // Monitora estado de autenticação
+  useEffect(() => {
+    if (!auth) {
+        setLoadingAuth(false);
+        return;
+    }
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setLoadingAuth(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Monitora dados do Firestore quando usuário está logado
+  useEffect(() => {
+    if (user) {
+      const unsubscribe = subscribeToFinanceData(user.uid, (newData) => {
+        // Garante que os dados estejam sempre ordenados cronologicamente
+        const sortedData = [...newData].sort((a, b) => {
+           const valA = a.year * 12 + a.monthIndex;
+           const valB = b.year * 12 + b.monthIndex;
+           return valA - valB;
+        });
+
+        setData(sortedData);
+        // Se nenhum mês estiver selecionado (primeiro load), seleciona o primeiro disponível ou o atual
+        if (!selectedMonthId && sortedData.length > 0) {
+            // Tenta achar o mês atual baseado na data real, senão pega o primeiro
+            const now = new Date();
+            const currentMonthId = `${now.toLocaleString('default', { month: 'short' }).toLowerCase()}-${now.getFullYear()}`;
+            const found = sortedData.find(m => m.id === currentMonthId);
+            setSelectedMonthId(found ? found.id : sortedData[0].id);
+        }
+      });
+      return () => unsubscribe();
+    } else {
+        setData([]);
+    }
+  }, [user, selectedMonthId]);
+
+  // Função auxiliar para salvar no Firestore
+  const updateData = useCallback((newData: MonthData[]) => {
+      if (user) {
+          saveFinanceData(user.uid, newData);
+      }
+  }, [user]);
 
   const currentMonthIndex = data.findIndex(m => m.id === selectedMonthId);
   const currentMonth = data[currentMonthIndex];
 
   const handleIncomeChange = useCallback((field: keyof IncomeDetails, value: number) => {
-    setData(prevData => {
-      const newData = [...prevData];
-      newData[currentMonthIndex] = {
-        ...newData[currentMonthIndex],
-        income: {
-          ...newData[currentMonthIndex].income,
-          [field]: value
-        }
-      };
-      return newData;
-    });
-  }, [currentMonthIndex]);
+    if (!currentMonth) return;
+    
+    const newData = [...data];
+    
+    // 1. Atualiza o valor da renda
+    const updatedIncome = {
+      ...newData[currentMonthIndex].income,
+      [field]: value
+    };
+
+    // 2. Calcula o novo total de renda
+    const totalNewIncome = (Object.values(updatedIncome) as number[]).reduce((a, b) => a + b, 0);
+
+    // 3. Recalcula automaticamente o orçamento sugerido (Default: 50/30/20)
+    // Isso atende ao pedido de o orçamento padrão levar em conta a entrada total
+    const updatedBudget = {
+      [ExpenseCategory.ESSENTIAL]: totalNewIncome * 0.50,
+      [ExpenseCategory.DESIRE]: totalNewIncome * 0.30,
+      [ExpenseCategory.INVESTMENT]: totalNewIncome * 0.20
+    };
+
+    newData[currentMonthIndex] = {
+      ...newData[currentMonthIndex],
+      income: updatedIncome,
+      budget: updatedBudget
+    };
+    
+    updateData(newData);
+  }, [data, currentMonthIndex, currentMonth, updateData]);
 
   const handleBudgetChange = useCallback((category: ExpenseCategory, value: number) => {
-    setData(prevData => {
-      const newData = [...prevData];
-      const currentBudget = newData[currentMonthIndex].budget;
-      
-      newData[currentMonthIndex] = {
-        ...newData[currentMonthIndex],
-        budget: {
-          ...currentBudget,
-          [category]: value
-        }
-      };
-      return newData;
-    });
-  }, [currentMonthIndex]);
+    if (!currentMonth) return;
 
-  const handleReplicateIncome = useCallback(() => {
-    if (!confirm("Deseja replicar os valores de renda deste mês para TODOS os meses futuros?")) return;
-
-    const incomeToCopy = { ...currentMonth.income };
+    const newData = [...data];
+    const currentBudget = newData[currentMonthIndex].budget;
     
-    setData(prevData => {
-      return prevData.map((month, index) => {
-        // Only update future months (including current if needed, though current is source)
-        if (index > currentMonthIndex) {
-          return {
-            ...month,
-            income: { ...incomeToCopy }
-          };
-        }
-        return month;
-      });
-    });
-    
-    alert("Rendas replicadas com sucesso!");
-  }, [currentMonth, currentMonthIndex]);
+    newData[currentMonthIndex] = {
+      ...newData[currentMonthIndex],
+      budget: {
+        ...currentBudget,
+        [category]: value
+      }
+    };
+    updateData(newData);
+  }, [data, currentMonthIndex, currentMonth, updateData]);
 
   const handleAddExpense = useCallback((expenseData: Omit<Expense, 'id'> & { totalInstallments?: number }) => {
-    // Generate a unique ID base
     const baseId = Date.now().toString();
+    const newData = [...data];
+    const { totalInstallments, amount, ...rest } = expenseData;
 
-    setData(prevData => {
-      const newData = [...prevData];
-      const { totalInstallments, amount, ...rest } = expenseData;
+    // Lógica para Parcelamento
+    if (totalInstallments && totalInstallments > 1) {
+      const monthlyAmount = amount / totalInstallments;
+      const originalDateParts = rest.date.split('-'); // YYYY-MM-DD
+      const startYear = parseInt(originalDateParts[0]);
+      const startMonth = parseInt(originalDateParts[1]) - 1; // 0-index
+      const day = parseInt(originalDateParts[2]);
 
-      // Lógica para Parcelamento
-      if (totalInstallments && totalInstallments > 1) {
-        const monthlyAmount = amount / totalInstallments;
-        const originalDateParts = rest.date.split('-'); // YYYY-MM-DD
-        const startYear = parseInt(originalDateParts[0]);
-        const startMonth = parseInt(originalDateParts[1]) - 1; // 0-index
-        const day = parseInt(originalDateParts[2]);
+      for (let i = 0; i < totalInstallments; i++) {
+        const dateObj = new Date(startYear, startMonth + i, day);
+        const targetYear = dateObj.getFullYear();
+        const targetMonthIndex = dateObj.getMonth(); // 0-11
+        
+        const targetDataIndex = newData.findIndex(m => m.year === targetYear && m.monthIndex === targetMonthIndex);
 
-        for (let i = 0; i < totalInstallments; i++) {
-          // Calcular data alvo para esta parcela
-          const dateObj = new Date(startYear, startMonth + i, day);
-          const targetYear = dateObj.getFullYear();
-          const targetMonthIndex = dateObj.getMonth(); // 0-11
-          
-          // Encontrar o mês correspondente no array de dados
-          const targetDataIndex = newData.findIndex(m => m.year === targetYear && m.monthIndex === targetMonthIndex);
+        if (targetDataIndex !== -1) {
+            const m = String(targetMonthIndex + 1).padStart(2, '0');
+            const d = String(dateObj.getDate()).padStart(2, '0');
+            const expenseDate = `${targetYear}-${m}-${d}`;
 
-          if (targetDataIndex !== -1) {
-             // Formata a data para YYYY-MM-DD
-             const m = String(targetMonthIndex + 1).padStart(2, '0');
-             const d = String(dateObj.getDate()).padStart(2, '0');
-             const expenseDate = `${targetYear}-${m}-${d}`;
-
-             newData[targetDataIndex] = {
-               ...newData[targetDataIndex],
-               expenses: [
-                 ...newData[targetDataIndex].expenses,
-                 {
-                   ...rest,
-                   id: `${baseId}-${i}`,
-                   amount: monthlyAmount,
-                   installments: `${i + 1}/${totalInstallments}`,
-                   date: expenseDate
-                 }
-               ]
-             };
-          }
+            newData[targetDataIndex] = {
+            ...newData[targetDataIndex],
+            expenses: [
+                ...newData[targetDataIndex].expenses,
+                {
+                ...rest,
+                id: `${baseId}-${i}`,
+                amount: monthlyAmount,
+                installments: `${i + 1}/${totalInstallments}`,
+                date: expenseDate
+                }
+            ]
+            };
         }
-      } 
-      // Lógica para Recorrência (Fixa)
-      else if (expenseData.isRecurring) {
-        for (let i = currentMonthIndex; i < newData.length; i++) {
-          const month = newData[i];
-          let expenseDate = rest.date;
+      }
+    } 
+    // Lógica para Recorrência (Fixa)
+    else if (expenseData.isRecurring) {
+      // Usa a mesma lógica de comparação cronológica
+      const sourceDateParts = rest.date.split('-');
+      const startYear = parseInt(sourceDateParts[0]);
+      const startMonth = parseInt(sourceDateParts[1]) - 1;
+      const startMonthValue = startYear * 12 + startMonth;
+      const originalDay = parseInt(sourceDateParts[2]);
 
-          if (i > currentMonthIndex) {
-             const originalDateParts = rest.date.split('-');
-             const originalDay = parseInt(originalDateParts[2]);
-             
-             const targetYear = month.year;
-             const targetMonthIndex = month.monthIndex; 
-             
-             const dateObj = new Date(targetYear, targetMonthIndex, originalDay);
+      // Mapeia todos os meses
+      for (let i = 0; i < newData.length; i++) {
+        const month = newData[i];
+        const currentMonthValue = month.year * 12 + month.monthIndex;
+
+        // Adiciona a despesa se for o mês atual ou futuro
+        if (currentMonthValue >= startMonthValue) {
+             // Calcula a data correta para este mês
+             const dateObj = new Date(month.year, month.monthIndex, originalDay);
              const y = dateObj.getFullYear();
              const m = String(dateObj.getMonth() + 1).padStart(2, '0');
              const d = String(dateObj.getDate()).padStart(2, '0');
-             expenseDate = `${y}-${m}-${d}`;
-          }
+             const expenseDate = `${y}-${m}-${d}`;
 
-          newData[i] = {
-            ...month,
+             newData[i] = {
+               ...month,
+               expenses: [
+                 ...month.expenses,
+                 {
+                   ...rest,
+                   amount: amount, 
+                   date: expenseDate,
+                   id: `${baseId}-${i}-${Math.random().toString(36).substr(2, 5)}`
+                 }
+               ]
+             };
+        }
+      }
+    } 
+    // Despesa Simples
+    else {
+      // Encontra o mês correto baseado na DATA da despesa, não necessariamente o selecionado
+      const dateParts = rest.date.split('-');
+      const expYear = parseInt(dateParts[0]);
+      const expMonthIndex = parseInt(dateParts[1]) - 1;
+      
+      const targetIndex = newData.findIndex(m => m.year === expYear && m.monthIndex === expMonthIndex);
+      
+      if (targetIndex !== -1) {
+          newData[targetIndex] = {
+            ...newData[targetIndex],
             expenses: [
-              ...month.expenses,
-              {
-                ...rest,
-                amount: amount, // Na recorrente o valor é cheio todo mês
-                date: expenseDate,
-                id: `${baseId}-${i}-${Math.random().toString(36).substr(2, 5)}`
-              }
+              ...newData[targetIndex].expenses,
+              { ...rest, amount: amount, id: baseId }
             ]
           };
-        }
-      } 
-      // Despesa Simples (apenas mês atual)
-      else {
-        newData[currentMonthIndex] = {
-          ...newData[currentMonthIndex],
-          expenses: [
-            ...newData[currentMonthIndex].expenses,
-            { ...rest, amount: amount, id: baseId }
-          ]
-        };
+      } else {
+          alert("A data selecionada pertence a um mês que não está cadastrado no sistema.");
+          return; 
       }
-      return newData;
-    });
-  }, [currentMonthIndex]);
+    }
+    
+    updateData(newData);
+  }, [data, updateData]);
 
-  const handleDeleteExpense = useCallback((expenseId: string) => {
-    setData(prevData => {
-      const newData = [...prevData];
+  const handleEditExpense = useCallback((updatedExpense: Expense) => {
+    if (!currentMonth) return;
+
+    const newData = [...data];
+    const expenses = [...newData[currentMonthIndex].expenses];
+    const expenseIndex = expenses.findIndex(e => e.id === updatedExpense.id);
+
+    if (expenseIndex !== -1) {
+      expenses[expenseIndex] = updatedExpense;
       newData[currentMonthIndex] = {
         ...newData[currentMonthIndex],
-        expenses: newData[currentMonthIndex].expenses.filter(e => e.id !== expenseId)
+        expenses: expenses
       };
-      return newData;
-    });
-  }, [currentMonthIndex]);
+      updateData(newData);
+    }
+  }, [data, currentMonthIndex, currentMonth, updateData]);
+
+  const handleDeleteExpense = useCallback((expenseId: string) => {
+    if (!currentMonth) return;
+    
+    const newData = [...data];
+    newData[currentMonthIndex] = {
+      ...newData[currentMonthIndex],
+      expenses: newData[currentMonthIndex].expenses.filter(e => e.id !== expenseId)
+    };
+    updateData(newData);
+  }, [data, currentMonthIndex, currentMonth, updateData]);
 
   const handleAIAnalysis = async () => {
+    if (!currentMonth) return;
     setIsAnalyzing(true);
     setAiAnalysis(null);
     const result = await analyzeFinances(currentMonth);
     setAiAnalysis(result);
     setIsAnalyzing(false);
   };
+
+  const handleLogout = async () => {
+      await logoutUser();
+  };
+
+  // Loading State
+  if (loadingAuth) {
+      return (
+          <div className="min-h-screen flex items-center justify-center bg-gray-50">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
+          </div>
+      );
+  }
+
+  // Login Screen
+  if (!user) {
+      return <Login onLoginSuccess={() => {}} />;
+  }
+
+  // App Content (Loading Data or Data Ready)
+  if (data.length === 0) {
+       return (
+          <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mb-4"></div>
+              <p className="text-gray-600">Carregando dados da família...</p>
+          </div>
+      );
+  }
+
+  // Safe check if selectedMonthId became invalid or data changed structure
+  if (!currentMonth) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-50">
+            <p>Selecionando período...</p>
+        </div>
+      )
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 pb-20">
@@ -192,10 +305,21 @@ const App: React.FC = () => {
             <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-indigo-200" viewBox="0 0 20 20" fill="currentColor">
               <path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1v-5zM8 7a1 1 0 011-1h2a1 1 0 011 1v9a1 1 0 01-1 1H9a1 1 0 01-1-1V7zM14 4a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1h-2a1 1 0 01-1-1V4z" />
             </svg>
-            <h1 className="text-xl font-bold tracking-tight">Família Financeira</h1>
+            <div>
+                <h1 className="text-xl font-bold tracking-tight">Família Financeira</h1>
+                <p className="text-xs text-indigo-300 hidden sm:block">Conectado como {user.email}</p>
+            </div>
           </div>
-          <div className="text-sm font-medium text-indigo-200 bg-indigo-800 px-3 py-1 rounded-full">
-            {currentMonth.monthName} {currentMonth.year}
+          <div className="flex items-center gap-4">
+            <div className="text-sm font-medium text-indigo-200 bg-indigo-800 px-3 py-1 rounded-full hidden sm:block">
+                {currentMonth.monthName} {currentMonth.year}
+            </div>
+            <button 
+                onClick={handleLogout}
+                className="text-sm bg-indigo-800 hover:bg-indigo-900 px-3 py-2 rounded text-white transition-colors"
+            >
+                Sair
+            </button>
           </div>
         </div>
       </header>
@@ -258,8 +382,7 @@ const App: React.FC = () => {
           
           <IncomeForm 
             income={currentMonth.income} 
-            onChange={handleIncomeChange} 
-            onReplicate={handleReplicateIncome}
+            onChange={handleIncomeChange}
           />
 
           <BudgetForm 
@@ -270,6 +393,7 @@ const App: React.FC = () => {
           <ExpenseTable 
             expenses={currentMonth.expenses}
             onAddExpense={handleAddExpense}
+            onEditExpense={handleEditExpense}
             onDeleteExpense={handleDeleteExpense}
           />
         </section>
